@@ -1,0 +1,12 @@
+{
+  "name": "OpenQA Job Settings devcontainer",
+  "image": "registry.opensuse.org/opensuse/tumbleweed:latest",
+  "features": {},
+  "postCreateCommand": "zypper -n ref && zypper -n in -t pattern devel_C_C++ perl perl-App-cpanminus git make gcc && cpanm --notest --installdeps . || true",
+  "customizations": {
+    "vscode": {
+      "extensions": ["ms-vscode.cpptools", "EditorConfig.EditorConfig"]
+    }
+  },
+  "remoteUser": "vscode"
+}
