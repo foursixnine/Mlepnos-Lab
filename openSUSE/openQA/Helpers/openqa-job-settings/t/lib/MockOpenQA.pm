@@ -113,14 +113,14 @@ sub start_mock_server {
             }
         };
 
-        delete '/api/v1/products/:id' => sub {
+        delete('/api/v1/products/:id' => sub {
             my $c = shift;
             my $id = $c->param('id');
             push @$requests, {method => 'DELETE', path => "/api/v1/products/$id"};
-            delete $products{$id};
+            CORE::delete $products{$id};
             $write_log->();
             $c->render(json => { result => 1 });
-        };
+        });
 
         # Machines (minimal; static responses)
         my %machines = (111 => { id => 111, name => 'mock-machine', backend => 'qemu' });
