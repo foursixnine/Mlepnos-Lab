@@ -1,15 +1,23 @@
-PR: Add Mojolicious mock server and basic bump integration test
+PR: tests: add Mojolicious mock server and basic bump integration test
 
-This branch adds a small Mojolicious mock server helper and a thin integration
-test exercising the jobgroups-cli bump command.
+This PR adds a small Mojolicious-based mock server helper and a thin integration
+test that runs the real CLI (jobgroups-cli bump) against the mocked openQA API.
 
-Files added:
+Files added on branch `tests/mock-server-cli` (base: `openqa-job-settings`):
+
 - cpanfile
 - openSUSE/openQA/Helpers/openqa-job-settings/t/lib/MockOpenQA.pm
 - openSUSE/openQA/Helpers/openqa-job-settings/t/01-cli-basic.t
 
-Test strategy:
-- Start the mock server from the test.
-- Run the real CLI as a subprocess pointing to mock server.
-- Use OpenQA::Client and Mojo::JSON to inspect the mock server state
-  and assert the bump command updated product settings.
+Notes:
+- Tests use Mojo::JSON and Mojolicious only (no external JSON modules).
+- Tests run the real CLI as a subprocess and point it to the mock server
+  with --host and --target-host.
+- The mock server implements minimal endpoints needed for the bump test
+  (products, machines, test_suites, job_templates). It records requests
+  and exposes them via GET /__requests for assertions.
+
+How to run locally:
+
+cd openSUSE/openQA/Helpers/openqa-job-settings
+prove -Ilib -I t/lib
