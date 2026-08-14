@@ -2,81 +2,144 @@ use strict;
 use warnings;
 use Test::More;
 use FindBin;
-use lib "$FindBin::RealBin/../t/lib";
+use lib "$FindBin::RealBin/../lib";
 
-use MockOpenQA qw(start_mock_server stop_mock_server mock_base_url req_file_path);
+use IO::Socket::INET;
 use Mojo::JSON qw(decode_json);
-use OpenQA::Client;
+use Mojo::Server::Daemon;
+use Mojolicious::Lite;
+use Test::Mojo;
 
-# Start mock server
-my ($pid, $port, $req_file) = start_mock_server();
-ok($pid, 'mock server started');
+my %products = (
+    201 => {
+        id          => 201,
+        distri      => 'mockdistri',
+        version     => '16.0',
+        arch        => 'x86_64',
+        flavor      => 'default',
+        description => 'mock',
+        settings    => [ { key => 'VERSION', value => '16.0' } ],
+    },
+);
+my $next_product_id = 202;
+my $requests = [];
+
+my $app = app;
+
+$app->routes->get('/api/v1/products' => sub {
+    my $c = shift;
+    push @$requests, { method => 'GET', path => '/api/v1/products' };
+    my @list = map { $products{$_} } sort { $a <=> $b } keys %products;
+    $c->render(json => { Products => \@list });
+});
+
+$app->routes->get('/api/v1/products/:id' => sub {
+    my $c = shift;
+    my $id = $c->param('id');
+    push @$requests, { method => 'GET', path => "/api/v1/products/$id" };
+    if ($products{$id}) {
+        $c->render(json => { product => $products{$id} });
+    }
+    else {
+        $c->render(json => { error => 'Not found' }, status => 404);
+    }
+});
+
+$app->routes->post('/api/v1/products' => sub {
+    my $c = shift;
+    my $data = eval { decode_json($c->req->body || '{}') } || {};
+    push @$requests, { method => 'POST', path => '/api/v1/products', body => $c->req->body };
+    my $id = $next_product_id++;
+    $data->{id} = $id;
+    $data->{settings} ||= [];
+    $products{$id} = $data;
+    $c->render(json => { id => $id });
+});
+
+$app->routes->put('/api/v1/products/:id' => sub {
+    my $c = shift;
+    my $id = $c->param('id');
+    my $data = eval { decode_json($c->req->body || '{}') } || {};
+    push @$requests, { method => 'PUT', path => "/api/v1/products/$id", body => $c->req->body };
+    if ($products{$id}) {
+        for my $k (keys %$data) {
+            $products{$id}{$k} = $data->{$k};
+        }
+        if (ref $data->{settings} eq 'HASH') {
+            my @settings = map { { key => $_, value => $data->{settings}{$_} } } keys %{ $data->{settings} };
+            $products{$id}{settings} = \@settings;
+        }
+        $c->render(json => { result => 1 });
+    }
+    else {
+        $c->render(json => { error => 'Not found' }, status => 404);
+    }
+});
+
+$app->routes->delete('/api/v1/products/:id' => sub {
+    my $c = shift;
+    my $id = $c->param('id');
+    push @$requests, { method => 'DELETE', path => "/api/v1/products/$id" };
+    delete $products{$id};
+    $c->render(json => { result => 1 });
+});
+
+$app->routes->get('/__requests' => sub {
+    my $c = shift;
+    $c->render(json => $requests);
+});
+
+my $sock = IO::Socket::INET->new(
+    Listen    => 1,
+    LocalAddr => '127.0.0.1',
+    LocalPort => 0,
+    Proto     => 'tcp',
+) or die "cannot get free port: $!";
+my $port = $sock->sockport;
+close $sock;
+
+my $daemon = Mojo::Server::Daemon->new(app => $app, listen => ["http://127.0.0.1:$port"]);
+$daemon->start;
 
 my $host = "127.0.0.1:$port";
+my $t = Test::Mojo->new(app => $app);
+$t->get_ok('/api/v1/products')->status_is(200)->json_has('/Products');
 
-# Run the CLI as requested
-chdir "$FindBin::RealBin/..";    # into openSUSE/openQA/Helpers/openqa-job-settings
-
-my $script = "perl bin/jobgroups-cli";
+chdir "$FindBin::RealBin/..";
+my $script = 'perl bin/jobgroups-cli';
 my $cmd = qq{$script bump --host $host --target-host $host --match VERSION=16.0 --set VERSION=16.1 --no-dry-run --yes --no-delete-target 2>&1};
 my $output = `$cmd`;
-my $exit   = $? >> 8;
+my $exit = $? >> 8;
 
-is($exit, 0, "CLI exited with code 0");
+is($exit, 0, 'CLI exited with code 0');
 
-# Build client to query mock server
-my $url = OpenQA::Client::url_from_host($host);
-my $client = OpenQA::Client->new(api => $url->host);
-
-# First fetch list of products the CLI would have queried
-my $products_url = $url->clone->path('/api/v1/products');
-my $res = $client->get($products_url)->res;
-ok($res && $res->is_success, 'fetched products list');
-my $products = decode_json($res->body || '[]');
-
-ok(ref $products eq 'HASH' && $products->{Products}, 'products structure present');
-
-# Now fetch recorded requests for assertion
-my $reqs_url = $url->clone->path('/__requests');
-my $reqs_res = $client->get($reqs_url)->res;
-ok($reqs_res && $reqs_res->is_success, 'fetched recorded requests');
-my $reqs = decode_json($reqs_res->body || '[]');
-
+my $reqs = $t->get_ok('/__requests')->status_is(200)->tx->res->json;
 ok(@$reqs >= 2, 'mock server saw at least two requests');
 
-# Look for a PUT or POST to /api/v1/products or /api/v1/products/:id
-my ($put_req) = grep { ($_->{method} || '') =~ /^PUT|POST$/ && ($_->{path} || '') =~ m{^/api/v1/products} } @$reqs;
-ok($put_req, 'found POST/PUT to products');
+my ($update_req) = grep {
+    ($_->{method} || '') =~ /^PUT|POST$/ && ($_->{path} || '') =~ m{^/api/v1/products}
+} @$reqs;
+ok($update_req, 'found POST/PUT to products');
 
-# Extract the id used (either returned by POST or used in PUT)
-# If POST was used, mock server returns id and the script should then GET it; test final state by GET id
 my $final_ok = 0;
-if ($put_req->{method} eq 'POST') {
-    # parse POST response id by fetching products list again and finding a product with settings VERSION=16.1
-    my $res2 = $client->get($products_url)->res;
-    ok($res2 && $res2->is_success, 'fetched products list after POST');
-    my $products2 = decode_json($res2->body || '[]');
-    for my $p (@{$products2->{Products}}) {
-        if ($p->{settings}) {
-            for my $s (@{$p->{settings}}) {
-                if ($s->{key} eq 'VERSION' && $s->{value} eq '16.1') {
-                    $final_ok = 1;
-                    last;
-                }
+if ($update_req->{method} eq 'POST') {
+    my $products2 = $t->get_ok('/api/v1/products')->status_is(200)->tx->res->json;
+    for my $p (@{ $products2->{Products} }) {
+        next unless $p->{settings};
+        for my $s (@{ $p->{settings} }) {
+            if ($s->{key} eq 'VERSION' && $s->{value} eq '16.1') {
+                $final_ok = 1;
+                last;
             }
         }
     }
 }
 else {
-    # PUT case: get the id from path and fetch product by id
-    if ($put_req->{path} =~ m{^/api/v1/products/([0-9]+)}) {
+    if ($update_req->{path} =~ m{^/api/v1/products/([0-9]+)}) {
         my $id = $1;
-        my $product_url = $url->clone->path("/api/v1/products/$id");
-        my $prod_res = $client->get($product_url)->res;
-        ok($prod_res && $prod_res->is_success, 'fetched product by id');
-        my $prod = decode_json($prod_res->body || '{}');
-        if ($prod->{product} && $prod->{product}{settings}) {
-            for my $s (@{$prod->{product}{settings}}) {
+        my $product = $t->get_ok("/api/v1/products/$id")->status_is(200)->tx->res->json;
+        if ($product->{product} && $product->{product}{settings}) {
+            for my $s (@{ $product->{product}{settings} }) {
                 if ($s->{key} eq 'VERSION' && $s->{value} eq '16.1') {
                     $final_ok = 1;
                 }
@@ -86,8 +149,5 @@ else {
 }
 
 ok($final_ok, 'VERSION setting updated to 16.1 in product settings');
-
-# Stop mock server
-stop_mock_server();
 
 done_testing();
