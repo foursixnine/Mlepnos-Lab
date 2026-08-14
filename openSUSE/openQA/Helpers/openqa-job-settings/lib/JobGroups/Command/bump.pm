@@ -1,10 +1,15 @@
 package JobGroups::Command::bump;
-use Mojo::Base 'OpenQA::CLI::api', -signatures;
-use feature qw(say);
+use Mojo::Base 'Mojolicious::Command', -signatures;
+use Mojo::JSON qw(encode_json decode_json);
+
+## Dinamically load OpenQA::Client
+use lib "/usr/share/openqa/lib";
+use Mojo::Loader qw(load_class);
+
 use Getopt::Long qw(GetOptionsFromArray);
 use Mojo::URL;
-use Data::Dumper;
-use Module::Runtime qw(require_module);
+use Utils qw(debug);
+use Storable qw(dclone);
 
 has description => 'Manage products across openQA instances (match/set/create/delete)';
 has usage => sub {
@@ -13,64 +18,174 @@ has usage => sub {
       . "                      [--match key=value] [--set key=value] [--delete-target]\n"
       . "                      [--dry-run] [--no-dry-run --yes] [--retries N]\n\n"
       . "Examples:\n"
-      . "  jobgroups-cli bump --host http://src --target-host http://tgt --match VERSION=16.0 --set VERSION=16.1\n\n"
+      . "  # Dry-run: find VERSION=16.0 and show what would be created on target\n"
+      . "  jobgroups-cli bump --host http://src --target-host http://tgt --match VERSION=16.0 --set VERSION=16.1 --set MYVAR=%ARCH%\n\n"
       . "Defaults: dry-run (no writes). Pass --no-dry-run --yes to perform updates.\n";
 };
 
-sub _make_client_for_host ($self, $host, $apikey, $apisecret, $client_class) {
-    $host = "http://$host" if $host && $host !~ m{^https?://};
-    my $base_url = Mojo::URL->new($host // 'http://localhost');
-    my $api_section = $base_url->host // 'localhost';
-    $api_section .= ':' . $base_url->port if $base_url->port && $base_url->port !~ /^(?:80|443)$/;
+has opts => sub { {} };
 
-    $client_class //= 'OpenQA::Client';
-    eval { require_module($client_class); 1 } or die "Cannot load client class $client_class: $@";
+# Build a target client similar to OpenQA::Command->client behaviour
+sub _make_client_for_host ($self, $host) {
+    debug "Preparing Client for $host";
+    #TODO; Die if host doesn't have protocol set
+    die("host must be not empty got: $host") unless $host;
 
-    my %client_args = ( api => $api_section );
-    $client_args{apikey}    = $apikey    if defined $apikey;
-    $client_args{apisecret} = $apisecret if defined $apisecret;
+    my %opts = %{$self->opts};
+    my $base   = Mojo::URL->new($host);                         # full host URL with scheme
+    my $client_class = ($opts{client_class})? $opts{client_class} : 'OpenQA::Client';
+    my %client_args = map { $_ => $opts{$_} } grep { defined $opts{$_} } qw(apikey apisecret);
+    $client_args{api} = $base->host;
+
+    # Mojo::Loader::load_class returns false on success, or an error/exception on failure
+    if (my $e = load_class($client_class)) {
+        die "Cannot load client class $client_class: " . (ref $e ? $e : 'Module not found');
+    }
 
     my $c = $client_class->new(%client_args);
-    $c->ioloop(Mojo::IOLoop->singleton) if $c->can('ioloop');
-    $c->base_url($base_url) if $c->can('base_url');
+    $c->base_url($base)->ioloop(Mojo::IOLoop->singleton);
     $c->transactor->name('jobgroups-cli') if $c->can('transactor');
+
+    debug "Client for $host set", $c->base_url->to_string;
 
     return $c;
 }
 
-sub _product_matches ($self, $product, $match_criteria) {
-    for my $k (keys %$match_criteria) {
-        my $want = $match_criteria->{$k};
-        if (exists $product->{$k} && !ref $product->{$k}) {
-            return 0 unless defined $product->{$k} && $product->{$k} eq $want;
-            next;
+# Convert API-style settings array -> hash and ensure payload is a HASH with settings as a HASH ref.
+sub _normalize_product_for_api ($self, $product) {
+    return unless $product && ref $product eq 'HASH';
+
+    # If settings is an array of {key,value} entries, normalize to a key->value hash
+    if (ref $product->{settings} eq 'ARRAY') {
+        my %settings_hash;
+        for my $entry (@{ $product->{settings} }) {
+            if (ref $entry eq 'HASH' && exists $entry->{key}) {
+                $settings_hash{ $entry->{key} } = $entry->{value};
+            }
         }
-        my $found = 0;
-        for my $container (qw(settings variables attributes)) {
-            if (ref $product->{$container} eq 'HASH' && exists $product->{$container}{$k}) {
-                if (defined $product->{$container}{$k} && $product->{$container}{$k} eq $want) {
-                    $found = 1; last;
+        $product->{settings} = \%settings_hash;
+    }
+
+    # If settings absent, ensure it's at least an empty hashref to match API expectations
+    if (!defined $product->{settings} || ref $product->{settings} ne 'HASH') {
+        $product->{settings} = {} unless defined $product->{settings};
+        # if it was non-hash and not an array (unexpected), leave it alone to avoid data loss,
+        # but prefer hash for API consumption:
+        $product->{settings} = {} unless ref $product->{settings} eq 'HASH';
+    }
+
+    return $product;
+}
+
+# Helper: Extracts all defined values for $key across all locations in $product
+sub _get_product_values ($self, $product, $key) {
+    my @found;
+
+    # 1. Top-level scalar
+    if (exists $product->{$key} && !ref $product->{$key}) {
+        push @found, $product->{$key} if defined $product->{$key};
+    }
+
+    # 2. Nested containers
+    for my $container (qw(settings variables attributes)) {
+        next unless exists $product->{$container};
+
+        # Nested Hash: { settings => { key => value } }
+        if (ref $product->{$container} eq 'HASH' && exists $product->{$container}{$key}) {
+            my $val = $product->{$container}{$key};
+            push @found, $val if defined $val;
+        }
+        # Nested Array of Hashes: { settings => [ { key => '...', value => '...' } ] }
+        elsif (ref $product->{$container} eq 'ARRAY') {
+            for my $entry (@{ $product->{$container} }) {
+                if (ref $entry eq 'HASH' 
+                    && ($entry->{key} // '') eq $key 
+                    && defined $entry->{value}) 
+                {
+                    push @found, $entry->{value};
                 }
             }
         }
-        return 0 unless $found;
     }
+
+    return @found;
+}
+
+# match product top-level or in the common nested keys
+sub _product_matches ($self, $product, $filters) {
+    for my $filter (@$filters) {
+        my $op     = lc($filter->{op} // 'or');
+        my $key    = $filter->{key};
+        my @wants  = @{ $filter->{values} // [] };
+
+        my @actuals = $self->_get_product_values($product, $key);
+        # debug "_product_matches", {actuals => @actuals, key => $key, wants => \@wants, op => $op, product => $product};
+        # OPERATOR: OR / IN / EQ (Product value matches ANY specified value)
+        if ($op eq 'or' || $op eq 'in' || $op eq 'eq') {
+            my %want_set = map { $_ => 1 } @wants;
+            my $matched  = 0;
+            for my $act (@actuals) {
+                if ($want_set{$act}) {
+                    $matched = 1;
+                    last;
+                }
+            }
+            return 0 unless $matched;
+        }
+        # OPERATOR: AND (Product values contain ALL specified values)
+        elsif ($op eq 'and') {
+            my %actual_set = map { $_ => 1 } @actuals;
+            for my $w (@wants) {
+                return 0 unless $actual_set{$w};
+            }
+        }
+        # OPERATOR: NOT / NE (Product value matches NONE of specified values)
+        elsif ($op eq 'not' || $op eq 'ne') {
+            my %want_set = map { $_ => 1 } @wants;
+            for my $act (@actuals) {
+                return 0 if $want_set{$act};
+            }
+        }
+    }
+
     return 1;
 }
 
+# apply set criteria (key => value) to product (top-level or nested destination); returns number of changes
 sub _apply_set_criteria ($self, $product, $set_criteria) {
     my $changes = 0;
     for my $k (keys %$set_criteria) {
         my $val = $set_criteria->{$k};
+        # prefer to set in existing nested container if key exists there, otherwise set in settings
         my $placed = 0;
         for my $container (qw(settings variables attributes)) {
             if (ref $product->{$container} eq 'HASH' && exists $product->{$container}{$k}) {
-                $product->{$container}{$k} = $val; $placed = 1; last;
+                $product->{$container}{$k} = $val;
+                $placed = 1;
+                last;
+            }
+            # if settings is an array (source format), update existing entry in that array
+            if ($container eq 'settings' && ref $product->{settings} eq 'ARRAY') {
+                for my $entry (@{ $product->{settings} }) {
+                    if (ref $entry eq 'HASH' && $entry->{key} && $entry->{key} eq $k) {
+                        $entry->{value} = $val;
+                        $placed = 1;
+                        last;
+                    }
+                }
+                last if $placed;
             }
         }
         unless ($placed) {
-            $product->{settings} = {} unless ref $product->{settings} eq 'HASH';
-            $product->{settings}{$k} = $val;
+            # put into settings hash if exists, else create settings hash
+            if (!ref $product->{settings}) { $product->{settings} = {} }
+            if (ref $product->{settings} eq 'HASH') {
+                $product->{settings}{$k} = $val;
+            }
+            else {
+                # fallback: set as top-level if settings is a strange structure
+                $product->{$k} = $val;
+            }
         }
         $changes++;
     }
@@ -78,141 +193,216 @@ sub _apply_set_criteria ($self, $product, $set_criteria) {
 }
 
 sub run ($self, @args) {
-    my %opts = (
+    # detect presence of bare --target-host in args (no value) to treat it as intent to target localhost
+    my $target_host_flag_present = 0;
+    for (my $i = 0; $i < @args; $i++) {
+        my $a = $args[$i];
+        if ($a eq '--target-host' || $a =~ /^--target-host=/) {
+            $target_host_flag_present = 1;
+            last;
+        }
+    }
+
+    my %openqa_client = ( verbose => 0, pretty => 1, quiet => 1 );
+
+   my %opts = (
         host              => undef,
         apikey            => undef,
         apisecret         => undef,
-        'target-host'     => undef,
-        'target-apikey'   => undef,
-        'target-apisecret'=> undef,
+        target_host       => undef,
+        target_apikey     => undef,
+        target_apisecret  => undef,
         match             => [],
         set               => [],
-        'delete-target'   => 0,
+        delete_target     => 1,
         dry_run           => 1,
         yes               => 0,
         retries           => undef,
-        verbose           => 0,
-        quiet             => 0,
-        pretty            => 0,
-        links             => 0,
+        debug             => undef,
+        filters            => []
     );
 
+
+    my @raw_filters;
     GetOptionsFromArray(
         \@args,
+        'o3!'    => \$opts{o3},
         'host=s'               => \$opts{host},
         'apikey=s'             => \$opts{apikey},
         'apisecret=s'          => \$opts{apisecret},
-        'target-host:s'        => \$opts{'target-host'},
-        'target-apikey=s'      => \$opts{'target-apikey'},
-        'target-apisecret=s'   => \$opts{'target-apisecret'},
+        'target-host:s'        => \$opts{target_host},
+        'target-apikey=s'      => \$opts{target_apikey},
+        'target-apisecret=s'   => \$opts{target_apisecret},
         'match=s@'             => \$opts{match},
         'set=s@'               => \$opts{set},
-        'delete-target!'       => \$opts{'delete-target'},
+        'delete-target!'       => \$opts{delete_target},
         'dry-run!'             => \$opts{dry_run},
         'yes|y'                => \$opts{yes},
         'retries=i'            => \$opts{retries},
-        'verbose!'             => \$opts{verbose},
-        'quiet!'               => \$opts{quiet},
-        'pretty!'              => \$opts{pretty},
-        'links!'               => \$opts{links},
+        'debug'                => \$opts{debug},
+        'openqa-client-verbose!' => \$openqa_client{verbose},
+        'openqa-client-pretty!' => \$openqa_client{pretty},
+        'openqa-client-quiet!' => \$openqa_client{quiet},
+        'filter=s{3}' => \@raw_filters,
     ) or die $self->usage;
 
-    # forward global-style options to parent helpers
-    $self->options({ verbose => $opts{verbose}, quiet => $opts{quiet}, pretty => $opts{pretty}, links => $opts{links} });
+    # Clean post-processing loop
+    while (@raw_filters) {
+        my ($op, $key, $val_str) = splice(@raw_filters, 0, 3);
+        push @{ $opts{filters} }, {
+            op     => lc($op),
+            key    => $key,
+            values => [ split /,/, $val_str ],
+        };
+    }   
+    
+    $self->opts(\%opts);
+    # undef %opts;
 
-    # detect bare --target-host presence
-    my $target_host_flag_present = !!grep { $_ eq '--target-host' || /^--target-host=/ } @args;
+    local $Utils::Debug = 1 if $opts{debug};
+    if (!$opts{yes} && !$opts{dry_run}) {
+        $opts{dry_run} = 1;
+        debug "No yes detected, this is a forced dry run", {options => $self->opts};
+    }
 
-    if ($target_host_flag_present && (!defined $opts{'target-host'} || $opts{'target-host'} eq '')) {
-        $opts{'target-host'} = 'http://localhost';
+    $opts{host} = "https://openqa.opensuse.org" if $opts{o3};
+    if ($opts{o3} && !defined $opts{target_host}) {
+        $opts{target_host} = 'http://localhost';
     }
 
     my $src_host = $opts{host} // $ENV{OPENQA_HOST} // 'http://localhost';
     $src_host = "http://$src_host" if $src_host !~ m{^https?://};
 
-    $self->apikey($opts{apikey})    if defined $opts{apikey};
-    $self->apisecret($opts{apisecret}) if defined $opts{apisecret};
+    my $src_client = $self->_make_client_for_host($src_host);
 
-    say "Source host: $src_host";
-    say "Dry run mode (no writes) enabled" if $opts{dry_run} && !$opts{yes};
+    my $tgt_host = (defined $opts{target_host} && $opts{target_host} ne '') ? $opts{target_host} : die("'--target-host host' must be set");
+    $tgt_host = "http://$tgt_host" if $tgt_host !~ m{^https?://};
 
-    # create src client
-    my $src_client = $self->client(Mojo::URL->new($src_host));
-    my $products_url = Mojo::URL->new('/api/v1/products')->to_abs($src_client->base_url);
+    my $tgt_client;
+    if ($tgt_host ne $src_host) {
+        $tgt_client = $self->_make_client_for_host($tgt_host);
+    } else {
+        $tgt_client = $src_client;
+    }
 
-    my $tx = $src_client->build_tx(GET => $products_url);
-    my $rc = $self->retry_tx($src_client, $tx, $opts{retries});
-    return $rc if $rc != 0;
+    debug "Source $src_host";
+    debug "Target $tgt_host";
+    debug "Source host: ", {api => $src_client->{api}, base_url => $src_client->base_url->to_string};
+    debug "Target host: ", {api => $tgt_client->{api}, base_url => $tgt_client->base_url->to_string};
+    debug "Dry run mode (no writes) enabled" if $opts{dry_run} && !$opts{yes};
+    debug "Finished setting up the clients";
+
+    my $products_url = sub ($client){ return Mojo::URL->new('/api/v1/products')->to_abs($client->base_url) };
+    my $tx = $src_client->build_tx(GET => $products_url->($src_client));
+    my $rc = $src_client->start($tx);
+
+    if ($rc->res->code ne 200) {
+        debug "Source Server Response", $rc->res;
+    }
 
     my $json = $tx->res->json // {};
     my $products = $json->{products} // $json->{Products} // $json;
     $products = [$products] unless ref $products eq 'ARRAY';
 
     my %match_criteria;
-    for my $m (@{$opts{match}}) { $match_criteria{$1} = $2 if $m =~ /^([^=]+)=(.*)$/s }
+    for my $m (@{$opts{match}}) {
+        if ($m =~ /^([^=]+)=(.*)$/s) { $match_criteria{lc $1} = $2 }
+    }
     my %set_criteria;
-    for my $s (@{$opts{set}}) { $set_criteria{$1} = $2 if $s =~ /^([^=]+)=(.*)$/s }
-
-    my $tgt_host = defined $opts{'target-host'} ? $opts{'target-host'} : $src_host;
-    my $tgt_client;
-    if ($tgt_host eq $src_host && !defined $opts{'target-apikey'} && !defined $opts{'target-apisecret'}) {
-        $tgt_client = $src_client;
-        say "Target is same as source: " . $tgt_client->base_url->to_string;
-    }
-    else {
-        $tgt_client = $self->_make_client_for_host($tgt_host, $opts{'target-apikey'}, $opts{'target-apisecret'});
-        say "Target host: " . $tgt_client->base_url->to_string;
+    for my $s (@{$opts{set}}) {
+        if ($s =~ /^([^=]+)=(.*)$/s) { $set_criteria{lc $1} = $2 }
     }
 
-    my @candidates = grep { $self->_product_matches($_, \%match_criteria) } @$products;
-    say scalar(@candidates) . " product(s) matched criteria";
+    my @candidates = grep { $self->_product_matches($_, $self->opts->{filters}) } @$products;
+    debug scalar(@candidates) . " product(s) matched criteria";
+    debug scalar(@$products) . " Total product(s)";
+
+    if (scalar(@candidates) == 0){
+        debug "No products matched", {filters => \@{$self->opts->{filters}}, candidates => \@candidates};
+    } else {
+        # TODO: ask the user to confirm changes
+        debug "Candidates", {candidates => \@candidates};
+    }
 
     my @created_on_target;
+    my @deleted_on_target;
     for my $p (@candidates) {
-        debug("Source product:", $p) if $self->options->{verbose};
-        my $new = $p; # user requested no deep-clone for JSON payloads
-        delete $new->{id}; delete $new->{product_id} if exists $new->{product_id};
+        my $new = dclone($p);
+
+        delete $new->{id};
+        delete $new->{product_id} if exists $new->{product_id};
 
         my $changed = $self->_apply_set_criteria($new, \%set_criteria);
-        say "Prepared new product (changes applied: $changed)";
+        debug "Prepared new product (changes applied: $changed)";
 
-        debug("New product payload:", $new) if $self->options->{verbose};
+        # Normalize for API: convert settings array -> hash, ensure hashref
+        $self->_normalize_product_for_api($new);
+
+        my $new_product_name = qq{$new->{distri}-$new->{version}-$new->{flavor}-$new->{arch}};
+        my $old_product_name = qq{$p->{distri}-$p->{version}-$p->{flavor}-$p->{arch}};
+        debug "Preview for new product: ", { new => $new_product_name, old => $old_product_name, changed => $changed };
 
         if (!$opts{dry_run} && $opts{yes}) {
             my $create_url = Mojo::URL->new('/api/v1/products')->to_abs($tgt_client->base_url);
-            say "Creating product on target: $create_url";
             my $tx2 = $tgt_client->build_tx(POST => $create_url => json => $new);
-            my $rc2 = $self->retry_tx($tgt_client, $tx2, $opts{retries});
-            if ($rc2 == 0) {
-                my $res2 = $tx2->res;
-                my $created = $res2->json // {};
+
+            # debug "transaction ready", { url => $create_url->to_string };
+
+            # $tgt_client->on(start => sub {
+            #     debug "Starting transaction $create_url";
+            # });
+
+            my $rc2 = $tgt_client->start($tx2);
+            if ($rc2->res->code == 200) {
+                my $res2 = $rc2->res;
+                my $created = $res2->json;
+                $created->{name} = $new_product_name;
                 push @created_on_target, $created;
-                say "Product created on target (response): " . Dumper($created);
+                debug "Product created on target (response): ", $created;
             }
             else {
-                warn "Failed to create product on target (rc=$rc2)\n";
+                debug "Failed to create product on target", { wanted => $new, txn => $tx2->res->json, server_response => $rc2->res->json};
             }
-        }
-        else {
-            say "Dry run: would create product on target (use --no-dry-run --yes to apply)";
         }
     }
 
-    if ($opts{'delete-target'} && @created_on_target) {
+    if ($opts{delete_target} && @created_on_target) {
+        debug "before deleting", {creeated_on_target => \@created_on_target};
         for my $created (@created_on_target) {
-            my $tid = $created->{id} // $created->{product_id} // $created->{_id};
-            unless ($tid) { warn "Cannot delete created product - no id present in response: " . Dumper($created); next }
-            my $del_url = Mojo::URL->new("/api/v1/products/$tid")->to_abs($tgt_client->base_url);
-            say "Deleting created product on target: $del_url";
-            if (!$opts{dry_run} && $opts{yes}) {
-                my $txd = $tgt_client->build_tx(DELETE => $del_url);
-                my $rcd = $self->retry_tx($tgt_client, $txd, $opts{retries});
-                if ($rcd == 0) { say "Deleted target product $tid" }
-                else { warn "Failed to delete target product $tid (rc=$rcd)\n" }
+            my $tid = $created->{id};
+            my $name = $created->{name};
+            unless ($tid) {
+                debug "Cannot delete created $name - no id present in response: ", { created => $created};
+                next;
             }
-            else { say "Dry run: would delete target product $tid" }
+            my $del_url = Mojo::URL->new("/api/v1/products/$tid")->to_abs($tgt_client->base_url);
+            debug "Deleting created product on target: $del_url";
+                my $txd = $tgt_client->build_tx(DELETE => $del_url);
+                my $rcd = $tgt_client->start($txd);
+
+                if ($rcd->res->code == 200) {
+                    my $res = $rcd->res;
+                    my $deleted = $res->json // {};
+                    push @deleted_on_target, $deleted;
+                    debug "Deleted created on target (response): ", {deleted => $deleted};
+                }
+                else {
+                    # debug "Failed to delete product on target", { server_response => $rcd->res->json };
+                    debug "Failed to delete $tid", { txn => $txd->res->json, server_response => $rcd->res->json};
+                }
+        }
+
+        if (scalar(@created_on_target) == scalar(@deleted_on_target)){
+            debug "All records have been properly deleted";
         }
     }
+
+    debug "Source host: ", {api => $src_client->{api}, base_url => $src_client->base_url->to_string};
+    debug "Target host: ", {api => $tgt_client->{api}, base_url => $tgt_client->base_url->to_string};
+    debug "Dry run mode (no writes) enabled" if $opts{dry_run} && !$opts{yes};
+    debug "This is a dry run (use '--yes --no-dry-run' to write)" if $opts{dry_run};
+    debug "Records will be deleted after creation (use '--no-delete-target' to make them permanent)" if $opts{delete_target};
+    debug "Created ". scalar @created_on_target ." records on target host" if !$opts{delete_target} && $opts{yes};
 
     return 0;
 }
